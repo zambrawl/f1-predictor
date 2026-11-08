@@ -1,12 +1,17 @@
-"""Orchestratore: lanciato ogni ora da GitHub Actions (ven-lun). Decide da solo cosa fare."""
+"""Orchestratore: gira ogni ora (ogni 15 min nel weekend) e decide da solo cosa fare."""
 import datetime as dt
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
-from . import db, ingest, jolpica, model, notify, practice, weather
+from . import db, grid, ingest, jolpica, model, notify, weather
 from .config import ROOT
 from .features import make_features
 
-TODAY = dt.date.today()
+ROME = ZoneInfo("Europe/Rome")
+NOW = dt.datetime.now(dt.timezone.utc)
+TOP_N = 10
+DAILY_HOUR = 8            # ora italiana del riepilogo giornaliero
+REMINDER_MIN = 30         # promemoria a 30 minuti dalla sessione
 
 
 # ---------- stato (per non inviare due volte la stessa notifica)
@@ -21,7 +26,7 @@ def mark(key):
 
 # ---------- utilita'
 def load_odds(s, r):
-    """odds.csv: colonne season,round,code,odds (quote decimali). Si compila a mano prima della qualifica."""
+    """odds.csv: colonne season,round,code,odds (quote decimali)."""
     p = ROOT / "odds.csv"
     if not p.exists():
         return None
@@ -30,7 +35,7 @@ def load_odds(s, r):
     return o if len(o) else None
 
 
-def top_lines(cur, n=3):
+def top_lines(cur, n=TOP_N):
     top = cur.sort_values("prob", ascending=False).head(n)
     return "\n".join(f"{i + 1}. {x.code}  {x.prob * 100:.1f}%" for i, x in enumerate(top.itertuples()))
 
@@ -42,11 +47,11 @@ def value_lines(cur, odds):
         imp = imp / imp.sum()
     x = cur.set_index("code")[["prob"]].join(imp.rename("imp"), how="inner")
     x["edge"] = x["prob"] - x["imp"]
-    x = x[(x["edge"] > 0) & (x["prob"] >= 0.05)].sort_values("edge", ascending=False).head(3)
+    x = x[(x["edge"] > 0) & (x["prob"] >= 0.02)].sort_values("edge", ascending=False).head(TOP_N)
     if x.empty:
         return "Nessun pilota con valore positivo rispetto alle quote."
     return "\n".join(f"{i + 1}. {c}: modello {r.prob * 100:.0f}% vs quota {o[c]:.2f} "
-                     f"(implicita {r.imp * 100:.0f}%, vantaggio +{r.edge * 100:.0f} pt)"
+                     f"(implicita {r.imp * 100:.0f}%, +{r.edge * 100:.0f} pt)"
                      for i, (c, r) in enumerate(x.iterrows()))
 
 
@@ -57,18 +62,21 @@ def save_preds(cur, phase):
 
 
 def predict_phase(nxt, phase):
+    """Ritorna (previsioni, pioggia prevista, fonte della griglia)."""
     s, r = nxt["season"], nxt["round"]
     res, quali = db.read("results"), db.read("quali")
     sprint, wea = db.read("sprint"), db.read("weather")
-    qn = quali[(quali["season"] == s) & (quali["round"] == r)]
-    if phase == "post":     # griglia = ordine delle qualifiche (le penalita' non sono incluse)
-        rows = qn.merge(res.drop_duplicates(["driver_id"], keep="last")[["driver_id", "code"]],
-                        on="driver_id", how="left")
-        team = res.sort_values(["season", "round"]).drop_duplicates("driver_id", keep="last")[["driver_id", "team_id"]]
-        rows = rows.merge(team, on="driver_id", how="left").rename(columns={"qpos": "grid"})
+    src = "n.d. (prima delle qualifiche)"
+    if phase == "post":
+        qn = quali[(quali["season"] == s) & (quali["round"] == r)]
+        info = (res.sort_values(["season", "round"]).drop_duplicates("driver_id", keep="last")
+                [["driver_id", "code", "team_id"]])
+        rows = qn.merge(info, on="driver_id", how="left").rename(columns={"qpos": "grid"})
         rows["code"] = rows["code"].fillna(rows["driver_id"].str[:3].str.upper())
         rows = rows.dropna(subset=["team_id"])
-    else:                   # prima delle qualifiche: schieramento dell'ultima gara
+        new_grid, src = grid.resolve(s, r, rows)
+        rows["grid"] = new_grid.fillna(rows["grid"])
+    else:
         last = res[res["season"] == res["season"].max()]
         last = last[last["round"] == last["round"].max()]
         rows = last[["driver_id", "code", "team_id"]].copy()
@@ -83,21 +91,29 @@ def predict_phase(nxt, phase):
     feat = make_features(pd.concat([res, rows], ignore_index=True), quali, sprint, w)
     cur = feat[(feat["season"] == s) & (feat["round"] == r)].copy()
     cur["prob"] = model.predict(cur, phase)
-    return cur, rain
+    return cur, rain, src
 
 
 def rain_txt(rain):
     return "n.d." if pd.isna(rain) else f"{rain:.1f} mm nelle 3 ore di gara"
 
 
+def body(cur, rain, src, nxt):
+    msg = f"Meteo gara: {rain_txt(rain)}\nGriglia: {src}\n\n🥇 Top {TOP_N} per probabilita' di vittoria:\n{top_lines(cur)}"
+    odds = load_odds(nxt["season"], nxt["round"])
+    if odds is not None:
+        msg += f"\n\n💰 Migliori {TOP_N} di valore (modello vs quote):\n{value_lines(cur, odds)}"
+    return msg
+
+
 # ---------- flusso principale
 def main():
     nxt = jolpica.next_race()
-    ingest.refresh(sorted({TODAY.year, nxt["season"]} if nxt else {TODAY.year}))
+    ingest.refresh(sorted({NOW.year, nxt["season"]} if nxt else {NOW.year}))
     res, quali = db.read("results"), db.read("quali")
-    retrain = False
 
     # A) gare finite: confronto previsione/risultato e riaddestramento
+    retrain = False
     preds = db.read("predictions")
     if len(preds):
         for (s, r), g in preds[preds["phase"] == "post"].groupby(["season", "round"]):
@@ -109,54 +125,49 @@ def main():
             win = rr[rr["finish"] == 1].iloc[0]
             g = g.sort_values("prob", ascending=False).reset_index(drop=True)
             rank = g.index[g["code"] == win["code"]]
-            rank_txt = f"{rank[0] + 1}o nella mia previsione ({g.loc[rank[0], 'prob'] * 100:.0f}%)" if len(rank) else "non previsto"
+            rank_txt = (f"{rank[0] + 1}o nella mia previsione ({g.loc[rank[0], 'prob'] * 100:.0f}%)"
+                        if len(rank) else "non previsto")
             notify.send(f"🏆 {win['race_name']}: ha vinto {win['code']} ({rank_txt}).\n"
-                        f"La mia top 3 era:\n{top_lines(g, 3)}\n\n🔁 Modello riaddestrato con questa gara.")
+                        f"La mia top {TOP_N} era:\n{top_lines(g)}\n\n🔁 Modello riaddestrato con questa gara.")
             mark(f"result-{s}-{r}")
             retrain = True
     if retrain:
-        df = make_features(res, quali, db.read("sprint"), db.read("weather"))
-        model.train_all(df)
+        model.train_all(make_features(res, quali, db.read("sprint"), db.read("weather")))
 
-    # B) weekend in corso (venerdi' = 2 giorni prima, domenica = 0)
     if not nxt:
         return
     s, r = nxt["season"], nxt["round"]
-    days = (dt.date.fromisoformat(nxt["date"]) - TODAY).days
-    if not 0 <= days <= 2:
-        return
-    qn = quali[(quali["season"] == s) & (quali["round"] == r)]
+    has_quali = len(quali[(quali["season"] == s) & (quali["round"] == r)]) > 0
 
-    if len(qn):   # qualifiche ufficiali disponibili (cioe' sessione davvero conclusa, bandiere rosse incluse)
-        if sent(f"post-{s}-{r}"):
-            return
-        cur, rain = predict_phase(nxt, "post")
+    # B) qualifiche ufficiali appena disponibili (sessione davvero conclusa, bandiere rosse incluse)
+    if has_quali and not sent(f"post-{s}-{r}"):
+        cur, rain, src = predict_phase(nxt, "post")
         save_preds(cur, "post")
-        msg = (f"🏁 {nxt['race_name']} – dopo le qualifiche\n"
-               f"Meteo gara: {rain_txt(rain)}\n\n🥇 Top 3 per probabilita' di vittoria:\n{top_lines(cur)}")
-        odds = load_odds(s, r)
-        if odds is not None:
-            msg += f"\n\n💰 Top 3 di valore (modello vs quote):\n{value_lines(cur, odds)}"
-        else:
-            msg += "\n\n(Nessuna quota in odds.csv: ti mostro solo le probabilita'.)"
-        msg += "\n\nStrumento di analisi, non una garanzia. Gioca solo cio' che puoi permetterti di perdere."
-        notify.send(msg)
+        notify.send(f"🏁 {nxt['race_name']} – dopo le qualifiche\n{body(cur, rain, src, nxt)}")
         mark(f"post-{s}-{r}")
 
-    elif not sent(f"pre-{s}-{r}"):   # stima preliminare dopo le libere
-        pace = practice.long_run_pace(s, r)
-        if pace is None and days == 2:
-            return                   # libere non ancora disponibili: riprovo alla prossima ora
-        cur, rain = predict_phase(nxt, "pre")
-        save_preds(cur, "pre")
-        msg = (f"🔧 {nxt['race_name']} – stima preliminare (prima delle qualifiche)\n"
-               f"Meteo gara: {rain_txt(rain)}\n\n🥇 Top 3 provvisorio:\n{top_lines(cur)}")
-        if pace is not None:
-            name, p = pace
-            lines = "\n".join(f"{i + 1}. {c}  +{v - p.iloc[0]:.2f}s" for i, (c, v) in enumerate(p.head(6).items()))
-            msg += f"\n\n⏱ Ritmo long run {name} (giri puliti; carburante e gomme ignoti):\n{lines}"
-        notify.send(msg)
-        mark(f"pre-{s}-{r}")
+    # C) promemoria 30 minuti prima di ogni sessione (prove libere, sprint, qualifiche, gara)
+    for label, start in nxt["sessions"]:
+        mins = (start - NOW).total_seconds() / 60
+        key = f"sess-{s}-{r}-{label}"
+        if 0 < mins <= REMINDER_MIN and not sent(key):
+            cur, rain, src = predict_phase(nxt, "post" if has_quali else "pre")
+            if has_quali:
+                save_preds(cur, "post")
+            when = start.astimezone(ROME).strftime("%H:%M")
+            notify.send(f"⏱ Tra circa {round(mins)} minuti: {label} – {nxt['race_name']} (ore {when})\n"
+                        f"{body(cur, rain, src, nxt)}")
+            mark(key)
+
+    # D) riepilogo giornaliero (solo nei giorni senza sessioni, entro 14 giorni dalla gara)
+    local = NOW.astimezone(ROME)
+    session_today = any(st.astimezone(ROME).date() == local.date() for _, st in nxt["sessions"])
+    days_left = (dt.date.fromisoformat(nxt["date"]) - local.date()).days
+    key = f"daily-{local.date()}"
+    if not session_today and 0 < days_left <= 14 and local.hour >= DAILY_HOUR and not sent(key):
+        cur, rain, src = predict_phase(nxt, "pre")
+        notify.send(f"📅 {nxt['race_name']} tra {days_left} giorni – stima di oggi\n{body(cur, rain, src, nxt)}")
+        mark(key)
 
 
 if __name__ == "__main__":

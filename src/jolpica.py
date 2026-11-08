@@ -1,4 +1,5 @@
 """Client per Jolpica-F1 (successore di Ergast): calendario, risultati, qualifiche, sprint."""
+import datetime as dt
 import time
 import requests
 
@@ -60,6 +61,25 @@ def rows(path, inner):
     return out
 
 
+SESSIONS = [("FirstPractice", "Prove libere 1"), ("SecondPractice", "Prove libere 2"),
+            ("ThirdPractice", "Prove libere 3"), ("SprintQualifying", "Qualifiche Sprint"),
+            ("SprintShootout", "Qualifiche Sprint"), ("Sprint", "Sprint"),
+            ("Qualifying", "Qualifiche")]
+
+
+def _when(d):
+    t = d.get("time", "12:00:00Z").replace("Z", "+00:00")
+    return dt.datetime.fromisoformat(f"{d['date']}T{t}")
+
+
 def next_race():
+    """Prossima gara + orari (UTC) di tutte le sessioni del weekend."""
     races = _get("current/next")["RaceTable"]["Races"]
-    return _meta(races[0]) if races else None
+    if not races:
+        return None
+    race = races[0]
+    out = _meta(race)
+    sessions = [(label, _when(race[k])) for k, label in SESSIONS if k in race]
+    sessions.append(("Gara", _when(race)))
+    out["sessions"] = sorted(sessions, key=lambda x: x[1])
+    return out
