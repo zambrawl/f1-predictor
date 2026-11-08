@@ -4,6 +4,11 @@ on:
     - cron: "5 * * * *"          # ogni ora, ogni giorno (orario UTC)
     - cron: "*/15 * * * 5,6,0"   # ogni 15 min venerdi-domenica, per il promemoria 30 minuti prima
   workflow_dispatch:
+    inputs:
+      classifica:
+        description: "Invia subito la classifica su Telegram"
+        type: boolean
+        default: true
 permissions:
   contents: write
 concurrency:
@@ -23,6 +28,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_RANKING: ${{ github.event.inputs.classifica }}
       - name: Salva database e modelli
         run: |
           git config user.name "f1-bot"

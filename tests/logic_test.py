@@ -50,4 +50,16 @@ run.NOW = dt.datetime(2026, 5, 12, 9, 0, tzinfo=dt.timezone.utc)
 db.write("quali", q); n0 = len(msgs); run.main()
 assert len(msgs) == n0 + 1 and "tra 5 giorni" in msgs[-1]
 run.main(); assert len(msgs) == n0 + 1
+# --- comandi Telegram
+import os
+os.environ["TELEGRAM_CHAT_ID"] = "42"
+run.NOW = dt.datetime(2026, 5, 12, 10, 0, tzinfo=dt.timezone.utc)
+ups = [{"update_id": 10, "message": {"chat": {"id": 99}, "text": "/classifica"}},      # chat estranea: ignorata
+       {"update_id": 11, "message": {"chat": {"id": 42}, "text": "ciao"}}]
+notify.get_updates = lambda offset=None: ups
+n = len(msgs); assert run.handle_commands(nxt) is False and len(msgs) == n
+ups[:] = [{"update_id": 12, "message": {"chat": {"id": 42}, "text": "/classifica@F1ZamboBot"}}]
+assert run.handle_commands(nxt) is True and "Classifica attuale" in msgs[-1] and "10." in msgs[-1]
+assert db.read("tg")["offset"].iloc[0] == 12
+print(msgs[-1])
 print("LOGIC TEST OK")

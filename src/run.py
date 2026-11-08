@@ -1,5 +1,6 @@
 """Orchestratore: gira ogni ora (ogni 15 min nel weekend) e decide da solo cosa fare."""
 import datetime as dt
+import os
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
@@ -106,11 +107,57 @@ def body(cur, rain, src, nxt):
     return msg
 
 
+# ---------- comandi Telegram (/classifica) e invio classifica a richiesta
+COMMANDS = {"/classifica", "/top", "/previsione"}
+
+
+def send_ranking(nxt):
+    if not nxt:
+        notify.send("Nessuna gara in programma al momento.")
+        return
+    s, r = nxt["season"], nxt["round"]
+    quali = db.read("quali")
+    has_quali = len(quali[(quali["season"] == s) & (quali["round"] == r)]) > 0
+    cur, rain, src = predict_phase(nxt, "post" if has_quali else "pre")
+    stato = "dopo le qualifiche" if has_quali else "prima delle qualifiche"
+    notify.send(f"📊 Classifica attuale – {nxt['race_name']} ({stato})\n{body(cur, rain, src, nxt)}")
+
+
+def handle_commands(nxt):
+    """Legge i messaggi arrivati al bot: se scrivi /classifica (dalla tua chat), rispondo."""
+    chat = os.getenv("TELEGRAM_CHAT_ID")
+    old = db.read("tg")
+    offset = int(old["offset"].iloc[0]) + 1 if len(old) else None
+    ups = notify.get_updates(offset)
+    if not ups:
+        return False
+    wanted = False
+    for u in ups:
+        m = u.get("message") or {}
+        text = (m.get("text") or "").strip()
+        if str(m.get("chat", {}).get("id")) == str(chat) and text:
+            if text.split()[0].split("@")[0].lower() in COMMANDS:
+                wanted = True
+    db.write("tg", pd.DataFrame({"offset": [max(u["update_id"] for u in ups)]}))
+    if wanted:
+        send_ranking(nxt)
+    return wanted
+
+
 # ---------- flusso principale
 def main():
     nxt = jolpica.next_race()
     ingest.refresh(sorted({NOW.year, nxt["season"]} if nxt else {NOW.year}))
     res, quali = db.read("results"), db.read("quali")
+
+    # 0) comandi Telegram o richiesta manuale dal pulsante "Run workflow"
+    try:
+        asked = handle_commands(nxt)
+    except Exception as e:
+        print("[comandi] errore:", e)
+        asked = False
+    if os.getenv("FORCE_RANKING") == "true" and not asked:
+        send_ranking(nxt)
 
     # A) gare finite: confronto previsione/risultato e riaddestramento
     retrain = False
