@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+from . import db
 from .config import MODELS
 from .features import PRE, POST
 
@@ -61,3 +62,31 @@ def evaluate(df, last_n=3):
                   f"vincitore al 1o posto: {hit1 / races:.0%} | nei primi 3: {hit3 / races:.0%} | "
                   f"(baseline 'vince il poleman': {pole / races:.0%}) | "
                   f"log-loss: {np.mean(ll):.2f} (casuale = {np.log(20):.2f}, piu' basso e' meglio)")
+
+
+GROUPS = {"Qualifica/griglia": ["grid", "qgap", "drv_qgap5", "sprint_pos", "ahead_pos5", "behind_pos5"],
+          "Macchina": ["team_pos5", "team_pts5", "team_ytd_pos", "team_qgap5"],
+          "Pilota": ["drv_pos5", "drv_win5", "drv_pts5", "drv_ytd_pos", "drv_mate_delta5"],
+          "Esperienza": ["exp_races"],
+          "Pioggia": ["rain_mm", "drv_wet_gain"],
+          "Pista": ["drv_circ_pos", "circ_pole_win"],
+          "Libere": ["fp_best_gap", "fp_long_gap"],
+          "Affidabilita": ["drv_dnf10", "team_dnf10"]}
+
+
+def factor_weights(phase):
+    """Quanto pesa ogni gruppo di fattori nel modello (in %), dall'importanza delle feature."""
+    try:
+        b = xgb.Booster()
+        b.load_model(str(MODELS / f"{phase}.json"))
+        imp = b.get_score(importance_type="gain")
+    except Exception:
+        return {}
+    tot = sum(imp.values()) or 1
+    out = {g: 100 * sum(imp.get(f, 0) for f in fs) / tot for g, fs in GROUPS.items()}
+    return dict(sorted(((k, v) for k, v in out.items() if v >= 0.5), key=lambda x: -x[1]))
+
+
+def mark_trained(df):
+    d = df[df["finish"].notna()]
+    db.write("meta", pd.DataFrame({"k": ["trained_upto"], "v": [int((d["season"] * 100 + d["round"]).max())]}))

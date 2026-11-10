@@ -1,0 +1,44 @@
+name: operazioni-manuali
+on:
+  workflow_dispatch:
+    inputs:
+      azione:
+        description: "Cosa fare"
+        type: choice
+        default: bootstrap
+        options:
+          - bootstrap
+          - storico-libere
+permissions:
+  contents: write
+concurrency:
+  group: ${{ github.event.inputs.azione == 'storico-libere' && 'practice' || 'f1' }}
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Bootstrap (storico dal 2014 + addestramento)
+        if: ${{ github.event.inputs.azione == 'bootstrap' }}
+        run: python -m src.bootstrap
+      - name: Storico prove libere (riprendibile)
+        if: ${{ github.event.inputs.azione == 'storico-libere' }}
+        run: python -m src.bootstrap_practice --max-minutes 320
+      - name: Salva
+        if: always()
+        run: |
+          git config user.name "f1-bot"
+          git config user.email "f1-bot@users.noreply.github.com"
+          git add data models
+          if ! git diff --cached --quiet; then
+            git commit -m "operazione manuale: ${{ github.event.inputs.azione }}"
+            git pull --rebase origin main
+            git push
+          fi

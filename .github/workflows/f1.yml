@@ -1,14 +1,9 @@
 name: f1-predictor
 on:
   schedule:
-    - cron: "5 * * * *"          # ogni ora, ogni giorno (orario UTC)
-    - cron: "*/15 * * * 5,6,0"   # ogni 15 min venerdi-domenica, per il promemoria 30 minuti prima
+    - cron: "*/5 * * * 5,6,0"    # ogni 5 minuti venerdi-domenica (orario UTC): il massimo consentito da GitHub
+    - cron: "*/15 * * * 1-4"     # ogni 15 minuti lunedi-giovedi
   workflow_dispatch:
-    inputs:
-      classifica:
-        description: "Invia subito la classifica su Telegram"
-        type: boolean
-        default: true
 permissions:
   contents: write
 concurrency:
@@ -17,6 +12,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,10 +24,13 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FORCE_RANKING: ${{ github.event.inputs.classifica }}
       - name: Salva database e modelli
         run: |
           git config user.name "f1-bot"
           git config user.email "f1-bot@users.noreply.github.com"
           git add data models
-          git diff --cached --quiet || (git commit -m "aggiornamento automatico" && git push)
+          if ! git diff --cached --quiet; then
+            git commit -m "aggiornamento automatico"
+            git pull --rebase origin main
+            git push
+          fi

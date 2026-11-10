@@ -1,35 +1,45 @@
-"""Test con dati finti: verifica che feature, addestramento, valutazione e previsione girino."""
-import numpy as np, pandas as pd
-from src import db, model
-from src.features import make_features
+"""Calcoli: feature, assenza di 'dati dal futuro', valutazione, addestramento, previsione."""
+import numpy as np
+from tests.synth import make
+from src import model, practice, report
+from src.features import make_features, PRE, POST
 from src.config import DB
 
 if DB.exists():
     DB.unlink()
-rng = np.random.default_rng(0)
-teams = [f"t{i}" for i in range(10)]
-drivers = [(f"d{i}", f"D{i:02d}", teams[i // 2]) for i in range(20)]
-res, q, sp, w = [], [], [], []
-for s in range(2018, 2024):
-    for r in range(1, 21):
-        strength = {d: -(int(d[1:]) // 2) * 1.2 + rng.normal(0, 1.5) for d, _, _ in drivers}
-        order = sorted(strength, key=strength.get, reverse=True)
-        grid = {d: i + 1 for i, d in enumerate(sorted(strength, key=lambda d: strength[d] + rng.normal(0, 1)))}
-        for d, c, t in drivers:
-            res.append(dict(season=s, round=r, race_name=f"GP{r}", date="x", time="13:00:00Z", lat=0, lon=0,
-                            circuit_id=f"c{r}", driver_id=d, code=c, team_id=t, grid=grid[d],
-                            finish=order.index(d) + 1, status="Finished" if rng.random() > .08 else "Engine", points=0.0))
-            q.append(dict(season=s, round=r, driver_id=d, qpos=grid[d]))
-            if s >= 2021 and r % 5 == 0:
-                sp.append(dict(season=s, round=r, driver_id=d, sprint_pos=grid[d]))
-        w.append(dict(season=s, round=r, rain_mm=float(rng.random() < .2) * 3, temp=20.0))
-res, q, sp, w = map(pd.DataFrame, (res, q, sp, w))
-df = make_features(res, q, sp, w)
-assert not df[model.PHASES["pre"]].isna().any().any()
+res, q, sp, w, fp = make()
+fpt = practice.aggregate(fp)
+df = make_features(res, q, sp, w, fpt)
+
+# 1) nessuna feature vuota dove non deve esserlo
+for c in ["drv_pos5", "team_pos5", "drv_circ_pos", "drv_wet_gain", "exp_races", "drv_ytd_pos"]:
+    assert not df[c].isna().any(), c
+# 2) squadre rinominate = stessa macchina (toro_rosso -> alphatauri -> rb)
+assert "toro_rosso" not in set(df["team_id"]) and "alphatauri" not in set(df["team_id"])
+# 3) esperienza cresce, pilota nuovo parte dal valore della macchina
+d0 = df[df["driver_id"] == "d0"].sort_values(["season", "round"])
+assert d0["exp_races"].is_monotonic_increasing and d0["exp_races"].iloc[0] == 0
+assert abs(d0["drv_pos5"].iloc[0] - d0["team_pos5"].iloc[0]) < 1e-9
+# 4) NESSUN dato dal futuro: cambiare il risultato dell'ultima gara non deve cambiare le sue feature
+last = (res["season"] == res["season"].max()) & (res["round"] == res["round"].max())
+res2 = res.copy()
+res2.loc[last, "finish"] = res2.loc[last, "finish"].values[::-1]
+res2.loc[last, "status"] = "Engine"
+df2 = make_features(res2, q, sp, w, fpt)
+a = df[(df.season == 2026) & (df["round"] == 8)].set_index("driver_id").sort_index()
+b = df2[(df2.season == 2026) & (df2["round"] == 8)].set_index("driver_id").sort_index()
+for c in POST:
+    assert np.allclose(a[c].astype(float).fillna(-999), b[c].astype(float).fillna(-999)), f"leak in {c}"
+print("nessun dato dal futuro: OK")
+# 5) una macchina forte ha un punteggio macchina piu' alto di una debole
+cur = df[(df.season == 2026) & (df["round"] == 8)].copy()
+sc = report.factor_scores(cur)
+top_team = cur.loc[cur.driver_id == "d0"].index[0]; low_team = cur.loc[cur.driver_id == "d19"].index[0]
+assert sc.loc[top_team, "Macchina"] > sc.loc[low_team, "Macchina"]
+# 6) valutazione + addestramento + previsione normalizzata
 model.evaluate(df, last_n=2)
 model.train_all(df)
-cur = df[(df.season == 2023) & (df["round"] == 20)].copy()
 cur["prob"] = model.predict(cur, "post")
-print(cur.sort_values("prob", ascending=False)[["code", "grid", "prob"]].head(3))
 assert abs(cur["prob"].sum() - 1) < 1e-6
+print(model.factor_weights("post"))
 print("SMOKE TEST OK")

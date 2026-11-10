@@ -7,5 +7,5 @@ DATA.mkdir(exist_ok=True)
 MODELS.mkdir(exist_ok=True)
 DB = DATA / "f1.db"
 
-FIRST_SEASON = 2018      # primo anno dello storico
-HALF_LIFE_RACES = 40     # le gare piu' recenti pesano di piu' (dimezza ogni 40 gare)
+FIRST_SEASON = 2014      # primo anno dello storico (era ibrida)
+HALF_LIFE_RACES = 60     # le gare recenti pesano di piu (dimezza ogni 60 gare)

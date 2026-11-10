@@ -1,16 +1,17 @@
 """Griglia di partenza corretta. Fonti, in ordine di priorita':
-1) grid_override.csv  -> penalita' che inserisci tu (colonne: season,round,code,places;
-                          places = posti persi, oppure 99 = partenza dai box / ultimo)
-2) FastF1             -> GridPosition ufficiale, se disponibile e valida
-3) Qualifiche Jolpica -> ordine di qualifica (senza penalita')
+1) penalita' inserite da te dal bot (/penalita VER 3) -> applicate all'ordine di qualifica
+2) FastF1: GridPosition ufficiale, se disponibile e valida
+3) ordine di qualifica (senza penalita')
 """
 import pandas as pd
-from .config import ROOT
+from . import db
 
 
 def apply_penalties(order, penalties):
     order = list(order)
-    for code, places in penalties:
+    # si applicano partendo da chi si era qualificato meglio (non in ordine alfabetico)
+    pos = {c: i for i, c in enumerate(order)}
+    for code, places in sorted(penalties, key=lambda p: pos.get(p[0], 99)):
         if code not in order:
             continue
         i = order.index(code)
@@ -20,13 +21,12 @@ def apply_penalties(order, penalties):
     return {c: i + 1 for i, c in enumerate(order)}
 
 
-def _penalties(season, rnd):
-    p = ROOT / "grid_override.csv"
-    if not p.exists():
+def get_penalties(season, rnd):
+    p = db.read("penalties")
+    if p.empty:
         return []
-    o = pd.read_csv(p)
-    o = o[(o["season"] == season) & (o["round"] == rnd)]
-    return list(zip(o["code"], o["places"]))
+    p = p[(p["season"] == season) & (p["round"] == rnd)]
+    return list(zip(p["code"], p["places"]))
 
 
 def _fastf1_grid(season, rnd):
@@ -46,12 +46,12 @@ def _fastf1_grid(season, rnd):
 
 
 def resolve(season, rnd, rows):
-    """rows: DataFrame con 'code' e 'grid' (ordine di qualifica). Ritorna (griglia, fonte)."""
-    pen = _penalties(season, rnd)
+    """rows: DataFrame con 'code' e 'grid' (ordine di qualifica). Ritorna (griglia, fonte, penalita')."""
+    pen = get_penalties(season, rnd)
     order = rows.sort_values("grid")["code"].tolist()
     if pen:
-        return rows["code"].map(apply_penalties(order, pen)), "qualifiche + penalita' da grid_override.csv"
+        return rows["code"].map(apply_penalties(order, pen)), "qualifiche + penalita' inserite da te", pen
     g = _fastf1_grid(season, rnd)
     if g and rows["code"].isin(g.keys()).all():
-        return rows["code"].map(g), "FastF1 (griglia ufficiale)"
-    return rows["grid"], "ordine di qualifica (penalita' non incluse)"
+        return rows["code"].map(g), "FastF1 (griglia ufficiale)", []
+    return rows["grid"], "ordine di qualifica (penalita' non incluse)", []

@@ -1,21 +1,25 @@
-"""Orchestratore: gira ogni ora (ogni 15 min nel weekend) e decide da solo cosa fare."""
+"""Orchestratore. Gira ogni 5 minuti (ven-dom) / 15 minuti (lun-gio) su GitHub Actions.
+- risponde ai comandi Telegram (/classificagara, /classificaqualifiche, /penalita, /aiuto)
+- notifiche automatiche SOLO venerdi', sabato e domenica: promemoria 30 min prima di ogni sessione,
+  report dopo le qualifiche, esito della gara
+- riaddestra il modello dopo ogni gara"""
 import datetime as dt
 import os
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
-from . import db, grid, ingest, jolpica, model, notify, weather
+from . import bot, db, grid, ingest, jolpica, model, notify, practice, report, weather
 from .config import ROOT
 from .features import make_features
 
 ROME = ZoneInfo("Europe/Rome")
 NOW = dt.datetime.now(dt.timezone.utc)
-TOP_N = 10
-DAILY_HOUR = 8            # ora italiana del riepilogo giornaliero
-REMINDER_MIN = 30         # promemoria a 30 minuti dalla sessione
+REMINDER_MIN = 30
+NOTIFY_DAYS = {4, 5, 6}                     # venerdi' sabato domenica (lunedi' = 0)
+HEART = ROOT / "data" / "heartbeat.txt"
 
 
-# ---------- stato (per non inviare due volte la stessa notifica)
+# ---------- stato
 def sent(key):
     s = db.read("sent")
     return len(s) > 0 and key in set(s["key"])
@@ -25,9 +29,12 @@ def mark(key):
     db.upsert("sent", pd.DataFrame({"key": [key]}), ["key"])
 
 
-# ---------- utilita'
+def notify_day():
+    return NOW.astimezone(ROME).weekday() in NOTIFY_DAYS
+
+
+# ---------- quote (facoltative)
 def load_odds(s, r):
-    """odds.csv: colonne season,round,code,odds (quote decimali)."""
     p = ROOT / "odds.csv"
     if not p.exists():
         return None
@@ -36,46 +43,50 @@ def load_odds(s, r):
     return o if len(o) else None
 
 
-def top_lines(cur, n=TOP_N):
-    top = cur.sort_values("prob", ascending=False).head(n)
-    return "\n".join(f"{i + 1}. {x.code}  {x.prob * 100:.1f}%" for i, x in enumerate(top.itertuples()))
-
-
 def value_lines(cur, odds):
     o = odds.set_index("code")["odds"]
     imp = 1 / o
-    if imp.sum() >= 0.9:                       # tolgo il margine del bookmaker
+    if imp.sum() >= 0.9:
         imp = imp / imp.sum()
     x = cur.set_index("code")[["prob"]].join(imp.rename("imp"), how="inner")
     x["edge"] = x["prob"] - x["imp"]
-    x = x[(x["edge"] > 0) & (x["prob"] >= 0.02)].sort_values("edge", ascending=False).head(TOP_N)
+    x = x[(x["edge"] > 0) & (x["prob"] >= 0.02)].sort_values("edge", ascending=False).head(10)
     if x.empty:
         return "Nessun pilota con valore positivo rispetto alle quote."
-    return "\n".join(f"{i + 1}. {c}: modello {r.prob * 100:.0f}% vs quota {o[c]:.2f} "
-                     f"(implicita {r.imp * 100:.0f}%, +{r.edge * 100:.0f} pt)"
+    return "\n".join(f"{i + 1}. {c}: modello {r.prob * 100:.0f}% vs quota {o[c]:.2f} (+{r.edge * 100:.0f} pt)"
                      for i, (c, r) in enumerate(x.iterrows()))
 
 
-def save_preds(cur, phase):
-    p = cur[["season", "round", "driver_id", "code", "prob"]].copy()
-    p["phase"] = phase
-    db.upsert("predictions", p, ["season", "round", "phase", "driver_id"])
+# ---------- previsioni
+def fill_info(q, res):
+    """Completa codice e squadra dei piloti (utile per righe vecchie o piloti nuovi)."""
+    info = (res.sort_values(["season", "round"]).drop_duplicates("driver_id", keep="last")
+            [["driver_id", "code", "team_id"]].rename(columns={"code": "code_h", "team_id": "team_h"}))
+    q = q.merge(info, on="driver_id", how="left")
+    for c, h in (("code", "code_h"), ("team_id", "team_h")):
+        if c not in q:
+            q[c] = np.nan
+        q[c] = q[c].fillna(q[h])
+    q["code"] = q["code"].fillna(q["driver_id"].str[:3].str.upper())
+    q["team_id"] = q["team_id"].fillna("unknown")
+    return q.drop(columns=["code_h", "team_h"])
+
+
+def has_quali(nxt, quali):
+    return len(quali[(quali["season"] == nxt["season"]) & (quali["round"] == nxt["round"])]) > 0
 
 
 def predict_phase(nxt, phase):
-    """Ritorna (previsioni, pioggia prevista, fonte della griglia)."""
+    """Ritorna (previsioni, pioggia prevista, fonte griglia, penalita')."""
     s, r = nxt["season"], nxt["round"]
     res, quali = db.read("results"), db.read("quali")
     sprint, wea = db.read("sprint"), db.read("weather")
-    src = "n.d. (prima delle qualifiche)"
+    pens = []
+    src = "non ancora disponibile (prima delle qualifiche)"
     if phase == "post":
-        qn = quali[(quali["season"] == s) & (quali["round"] == r)]
-        info = (res.sort_values(["season", "round"]).drop_duplicates("driver_id", keep="last")
-                [["driver_id", "code", "team_id"]])
-        rows = qn.merge(info, on="driver_id", how="left").rename(columns={"qpos": "grid"})
-        rows["code"] = rows["code"].fillna(rows["driver_id"].str[:3].str.upper())
-        rows = rows.dropna(subset=["team_id"])
-        new_grid, src = grid.resolve(s, r, rows)
+        qn = fill_info(quali[(quali["season"] == s) & (quali["round"] == r)], res)
+        rows = qn[["driver_id", "code", "team_id", "qpos"]].rename(columns={"qpos": "grid"})
+        new_grid, src, pens = grid.resolve(s, r, rows)
         rows["grid"] = new_grid.fillna(rows["grid"])
     else:
         last = res[res["season"] == res["season"].max()]
@@ -89,78 +100,139 @@ def predict_phase(nxt, phase):
     rain, temp = weather.forecast(nxt)
     w = pd.concat([wea[~((wea["season"] == s) & (wea["round"] == r))],
                    pd.DataFrame([{"season": s, "round": r, "rain_mm": rain, "temp": temp}])])
-    feat = make_features(pd.concat([res, rows], ignore_index=True), quali, sprint, w)
+    feat = make_features(pd.concat([res, rows], ignore_index=True), quali, sprint, w, practice.table())
     cur = feat[(feat["season"] == s) & (feat["round"] == r)].copy()
     cur["prob"] = model.predict(cur, phase)
-    return cur, rain, src
+    return cur, rain, src, pens
 
 
-def rain_txt(rain):
-    return "n.d." if pd.isna(rain) else f"{rain:.1f} mm nelle 3 ore di gara"
+def save_preds(cur, phase):
+    p = cur[["season", "round", "driver_id", "code", "prob"]].copy()
+    p["phase"] = phase
+    db.upsert("predictions", p, ["season", "round", "phase", "driver_id"])
 
 
-def body(cur, rain, src, nxt):
-    msg = f"Meteo gara: {rain_txt(rain)}\nGriglia: {src}\n\n🥇 Top {TOP_N} per probabilita' di vittoria:\n{top_lines(cur)}"
-    odds = load_odds(nxt["season"], nxt["round"])
-    if odds is not None:
-        msg += f"\n\n💰 Migliori {TOP_N} di valore (modello vs quote):\n{value_lines(cur, odds)}"
-    return msg
+# ---------- risposte ai comandi
+def last_race(res):
+    last = res.sort_values(["season", "round"]).iloc[-1]
+    days = (NOW.date() - pd.Timestamp(last["date"]).date()).days
+    return last, days
 
 
-# ---------- comandi Telegram (/classifica) e invio classifica a richiesta
-COMMANDS = {"/classifica", "/top", "/previsione"}
-
-
-def send_ranking(nxt):
+def cmd_race(nxt):
+    res, quali = db.read("results"), db.read("quali")
+    if len(res):
+        last, ds = last_race(res)
+        if 0 <= ds <= 2:        # gara appena finita: mostro i tempi ufficiali
+            rr = res[(res["season"] == last["season"]) & (res["round"] == last["round"])]
+            return report.result_text(rr, last["race_name"])
     if not nxt:
-        notify.send("Nessuna gara in programma al momento.")
-        return
-    s, r = nxt["season"], nxt["round"]
-    quali = db.read("quali")
-    has_quali = len(quali[(quali["season"] == s) & (quali["round"] == r)]) > 0
-    cur, rain, src = predict_phase(nxt, "post" if has_quali else "pre")
-    stato = "dopo le qualifiche" if has_quali else "prima delle qualifiche"
-    notify.send(f"📊 Classifica attuale – {nxt['race_name']} ({stato})\n{body(cur, rain, src, nxt)}")
+        return "Nessuna gara in programma al momento."
+    post = has_quali(nxt, quali)
+    phase = "post" if post else "pre"
+    cur, rain, src, pens = predict_phase(nxt, phase)
+    odds = load_odds(nxt["season"], nxt["round"])
+    return report.race_prediction_text(
+        cur, nxt["race_name"], "dopo le qualifiche" if post else "prima delle qualifiche",
+        rain, src, pens, model.factor_weights(phase), value_lines(cur, odds) if odds is not None else None)
+
+
+def cmd_quali(nxt):
+    res, quali = db.read("results"), db.read("quali")
+    if nxt and has_quali(nxt, quali):
+        q = fill_info(quali[(quali["season"] == nxt["season"]) & (quali["round"] == nxt["round"])], res)
+        return report.quali_text(q, nxt["race_name"])
+    if len(res):
+        last, ds = last_race(res)
+        if 0 <= ds <= 3:
+            q = quali[(quali["season"] == last["season"]) & (quali["round"] == last["round"])]
+            if len(q):
+                return report.quali_text(fill_info(q, res), last["race_name"])
+    if nxt:
+        fp = practice.table()
+        fp = fp[(fp["season"] == nxt["season"]) & (fp["round"] == nxt["round"])]
+        if len(fp):
+            return report.practice_text(fp, nxt["race_name"])
+        return f"Qualifiche di {nxt['race_name']} non ancora disputate e nessun dato dalle libere."
+    return "Nessuna qualifica disponibile."
+
+
+def cmd_penalty(args, nxt):
+    res, quali = db.read("results"), db.read("quali")
+    last = res[res["season"] == res["season"].max()]
+    lineup = last[last["round"] == last["round"].max()][["driver_id", "code"]]
+    if nxt and has_quali(nxt, quali):
+        q = fill_info(quali[(quali["season"] == nxt["season"]) & (quali["round"] == nxt["round"])], res)
+        lineup = pd.concat([q[["driver_id", "code"]], lineup]).drop_duplicates("driver_id")
+    return bot.penalty_command(args, nxt, lineup)
+
+
+def reply_for(cmd, args, nxt):
+    if cmd in ("/classificagara", "/gara"):
+        return cmd_race(nxt)
+    if cmd in ("/classificaqualifiche", "/qualifiche"):
+        return cmd_quali(nxt)
+    if cmd == "/penalita":
+        return cmd_penalty(args, nxt)
+    return bot.HELP
 
 
 def handle_commands(nxt):
-    """Legge i messaggi arrivati al bot: se scrivi /classifica (dalla tua chat), rispondo."""
     chat = os.getenv("TELEGRAM_CHAT_ID")
     old = db.read("tg")
     offset = int(old["offset"].iloc[0]) + 1 if len(old) else None
     ups = notify.get_updates(offset)
     if not ups:
-        return False
-    wanted = False
+        return
+    db.write("tg", pd.DataFrame({"offset": [max(u["update_id"] for u in ups)]}))
+    seen = set()
     for u in ups:
         m = u.get("message") or {}
         text = (m.get("text") or "").strip()
-        if str(m.get("chat", {}).get("id")) == str(chat) and text:
-            if text.split()[0].split("@")[0].lower() in COMMANDS:
-                wanted = True
-    db.write("tg", pd.DataFrame({"offset": [max(u["update_id"] for u in ups)]}))
-    if wanted:
-        send_ranking(nxt)
-    return wanted
+        if str(m.get("chat", {}).get("id")) != str(chat) or not text.startswith("/"):
+            continue
+        cmd, args = bot.parse(text)
+        if cmd != "/penalita":
+            if (cmd, tuple(args)) in seen:
+                continue
+            seen.add((cmd, tuple(args)))
+        try:
+            notify.send(reply_for(cmd, args, nxt))
+        except Exception as e:
+            notify.send(f"⚠️ Non sono riuscito a rispondere a {cmd}: {e}")
 
 
 # ---------- flusso principale
-def main():
+def _main():
     nxt = jolpica.next_race()
-    ingest.refresh(sorted({NOW.year, nxt["season"]} if nxt else {NOW.year}))
-    res, quali = db.read("results"), db.read("quali")
+    full_ok = not sent(f"full-{NOW.date()}")
+    if ingest.refresh_smart(nxt, NOW, full_ok) == "full":
+        mark(f"full-{NOW.date()}")
+    if nxt:
+        practice.update_current(nxt, NOW, sent, mark)
 
-    # 0) comandi Telegram o richiesta manuale dal pulsante "Run workflow"
     try:
-        asked = handle_commands(nxt)
+        handle_commands(nxt)
     except Exception as e:
         print("[comandi] errore:", e)
-        asked = False
-    if os.getenv("FORCE_RANKING") == "true" and not asked:
-        send_ranking(nxt)
 
-    # A) gare finite: confronto previsione/risultato e riaddestramento
-    retrain = False
+    res, quali = db.read("results"), db.read("quali")
+    if res.empty:
+        return nxt
+
+    # riaddestramento silenzioso dopo ogni gara nuova
+    meta = db.read("meta")
+    trained = int(meta["v"].iloc[0]) if len(meta) else 0
+    if int((res["season"] * 100 + res["round"]).max()) > trained:
+        df = make_features(res, quali, db.read("sprint"), db.read("weather"), practice.table())
+        model.train_all(df)
+        model.mark_trained(df)
+
+    # --- da qui solo notifiche automatiche: SOLO venerdi', sabato, domenica
+    if not notify_day():
+        return nxt
+
+    # esito delle gare previste
     preds = db.read("predictions")
     if len(preds):
         for (s, r), g in preds[preds["phase"] == "post"].groupby(["season", "round"]):
@@ -172,49 +244,51 @@ def main():
             win = rr[rr["finish"] == 1].iloc[0]
             g = g.sort_values("prob", ascending=False).reset_index(drop=True)
             rank = g.index[g["code"] == win["code"]]
-            rank_txt = (f"{rank[0] + 1}o nella mia previsione ({g.loc[rank[0], 'prob'] * 100:.0f}%)"
-                        if len(rank) else "non previsto")
-            notify.send(f"🏆 {win['race_name']}: ha vinto {win['code']} ({rank_txt}).\n"
-                        f"La mia top {TOP_N} era:\n{top_lines(g)}\n\n🔁 Modello riaddestrato con questa gara.")
+            txt = (f"{rank[0] + 1}o nella mia previsione ({g.loc[rank[0], 'prob'] * 100:.0f}%)"
+                   if len(rank) else "non previsto")
+            top = "\n".join(f"{i + 1}. {x.code}  {x.prob * 100:.1f}%" for i, x in enumerate(g.head(10).itertuples()))
+            notify.send(f"🏆 {win['race_name']}: ha vinto {win['code']} ({txt}).\nLa mia top 10 era:\n{top}\n\n"
+                        f"Scrivi /classificagara per i tempi ufficiali.")
             mark(f"result-{s}-{r}")
-            retrain = True
-    if retrain:
-        model.train_all(make_features(res, quali, db.read("sprint"), db.read("weather")))
 
     if not nxt:
-        return
+        return nxt
     s, r = nxt["season"], nxt["round"]
-    has_quali = len(quali[(quali["season"] == s) & (quali["round"] == r)]) > 0
+    post = has_quali(nxt, quali)
 
-    # B) qualifiche ufficiali appena disponibili (sessione davvero conclusa, bandiere rosse incluse)
-    if has_quali and not sent(f"post-{s}-{r}"):
-        cur, rain, src = predict_phase(nxt, "post")
+    # qualifiche ufficiali appena disponibili (sessione davvero conclusa, bandiere rosse incluse)
+    if post and not sent(f"post-{s}-{r}"):
+        cur, rain, src, pens = predict_phase(nxt, "post")
         save_preds(cur, "post")
-        notify.send(f"🏁 {nxt['race_name']} – dopo le qualifiche\n{body(cur, rain, src, nxt)}")
+        notify.send(f"🏁 {nxt['race_name']} – dopo le qualifiche\nMeteo gara: {report.rain_txt(rain)}\n"
+                    f"Griglia: {src}\n\n🥇 Top 10 per probabilita' di vittoria:\n{report.compact_top(cur)}\n\n"
+                    f"Dettaglio: /classificagara · penalita': /penalita VER 3")
         mark(f"post-{s}-{r}")
 
-    # C) promemoria 30 minuti prima di ogni sessione (prove libere, sprint, qualifiche, gara)
-    for label, start in nxt["sessions"]:
+    # promemoria 30 minuti prima di ogni sessione
+    for label, start, kind in nxt["sessions"]:
         mins = (start - NOW).total_seconds() / 60
-        key = f"sess-{s}-{r}-{label}"
+        key = f"sess-{s}-{r}-{kind}"
         if 0 < mins <= REMINDER_MIN and not sent(key):
-            cur, rain, src = predict_phase(nxt, "post" if has_quali else "pre")
-            if has_quali:
-                save_preds(cur, "post")
+            cur, rain, src, pens = predict_phase(nxt, "post" if post else "pre")
             when = start.astimezone(ROME).strftime("%H:%M")
-            notify.send(f"⏱ Tra circa {round(mins)} minuti: {label} – {nxt['race_name']} (ore {when})\n"
-                        f"{body(cur, rain, src, nxt)}")
+            notify.send(f"⏰ Tra circa {round(mins)} minuti: {label} – {nxt['race_name']} (ore {when})\n"
+                        f"Meteo gara: {report.rain_txt(rain)}\n\n🥇 Top 10 vittoria:\n{report.compact_top(cur)}\n\n"
+                        f"Dettaglio: /classificagara")
             mark(key)
+    return nxt
 
-    # D) riepilogo giornaliero (solo nei giorni senza sessioni, entro 14 giorni dalla gara)
-    local = NOW.astimezone(ROME)
-    session_today = any(st.astimezone(ROME).date() == local.date() for _, st in nxt["sessions"])
-    days_left = (dt.date.fromisoformat(nxt["date"]) - local.date()).days
-    key = f"daily-{local.date()}"
-    if not session_today and 0 < days_left <= 14 and local.hour >= DAILY_HOUR and not sent(key):
-        cur, rain, src = predict_phase(nxt, "pre")
-        notify.send(f"📅 {nxt['race_name']} tra {days_left} giorni – stima di oggi\n{body(cur, rain, src, nxt)}")
-        mark(key)
+
+def heartbeat():
+    """Un piccolo commit al mese, cosi' GitHub non disattiva i workflow schedulati per inattivita'."""
+    month = NOW.strftime("%Y-%m")
+    if not HEART.exists() or HEART.read_text().strip() != month:
+        HEART.write_text(month)
+
+
+def main():
+    _main()
+    heartbeat()
 
 
 if __name__ == "__main__":

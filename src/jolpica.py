@@ -4,6 +4,11 @@ import time
 import requests
 
 BASE = "https://api.jolpi.ca/ergast/f1"
+# (chiave Jolpica, etichetta italiana, tipo)
+SESSIONS = [("FirstPractice", "Prove libere 1", "FP1"), ("SecondPractice", "Prove libere 2", "FP2"),
+            ("ThirdPractice", "Prove libere 3", "FP3"), ("SprintQualifying", "Qualifiche Sprint", "SQ"),
+            ("SprintShootout", "Qualifiche Sprint", "SQ"), ("Sprint", "Sprint", "SPR"),
+            ("Qualifying", "Qualifiche", "Q")]
 
 
 def _get(path, params=None):
@@ -36,7 +41,7 @@ def _meta(race):
 
 
 def rows(path, inner):
-    """Scarica tutte le righe (con paginazione). inner = Results | QualifyingResults | SprintResults"""
+    """Tutte le righe (con paginazione). inner = Results | QualifyingResults | SprintResults"""
     out, offset = [], 0
     while True:
         m = _get(path, {"limit": 100, "offset": offset})
@@ -53,6 +58,8 @@ def rows(path, inner):
                     "grid": _int(r.get("grid")),
                     "status": r.get("status"),
                     "points": float(r.get("points", 0) or 0),
+                    "race_time": (r.get("Time") or {}).get("time"),
+                    "q1": r.get("Q1"), "q2": r.get("Q2"), "q3": r.get("Q3"),
                 })
         offset += 100
         if offset >= int(m["total"]):
@@ -61,25 +68,19 @@ def rows(path, inner):
     return out
 
 
-SESSIONS = [("FirstPractice", "Prove libere 1"), ("SecondPractice", "Prove libere 2"),
-            ("ThirdPractice", "Prove libere 3"), ("SprintQualifying", "Qualifiche Sprint"),
-            ("SprintShootout", "Qualifiche Sprint"), ("Sprint", "Sprint"),
-            ("Qualifying", "Qualifiche")]
-
-
 def _when(d):
     t = d.get("time", "12:00:00Z").replace("Z", "+00:00")
     return dt.datetime.fromisoformat(f"{d['date']}T{t}")
 
 
 def next_race():
-    """Prossima gara + orari (UTC) di tutte le sessioni del weekend."""
+    """Prossima gara + orari UTC di tutte le sessioni: lista di (etichetta, inizio, tipo)."""
     races = _get("current/next")["RaceTable"]["Races"]
     if not races:
         return None
     race = races[0]
     out = _meta(race)
-    sessions = [(label, _when(race[k])) for k, label in SESSIONS if k in race]
-    sessions.append(("Gara", _when(race)))
+    sessions = [(label, _when(race[k]), kind) for k, label, kind in SESSIONS if k in race]
+    sessions.append(("Gara", _when(race), "R"))
     out["sessions"] = sorted(sessions, key=lambda x: x[1])
     return out
